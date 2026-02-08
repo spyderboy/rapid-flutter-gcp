@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 import { exec } from "child_process";
 import os from "os";
-import ora from 'ora';
+
+let oraInstance = null;
+try {
+  const oraModule = await import('ora');
+  oraInstance = oraModule.default;
+} catch (e) {
+  console.log("Warning: 'ora' not found. Progress indicators will fallback to console messages.");
+}
 
 /**
  * Executes a shell command asynchronously and streams its output to the console.
@@ -87,13 +94,27 @@ async function detectPkgMgr() {
  * @returns {Promise<string>} A promise that resolves with the stdout of the command, or rejects on error.
  */
 async function runWithSpinner(cmd, message, { silent = false } = {}) {
-  const spinner = ora(message).start();
+  let spinner = null;
+  if (oraInstance) {
+    spinner = oraInstance(message).start();
+  } else {
+    console.log(`\n--- ${message} ---`); // Fallback for no ora
+  }
+
   try {
     const result = await run(cmd, { silent });
-    spinner.succeed(message + ' Done.');
+    if (spinner) {
+      spinner.succeed(message + ' Done.');
+    } else {
+      console.log(`--- ${message} Done. ---`); // Fallback for no ora
+    }
     return result;
   } catch (error) {
-    spinner.fail(message + ' Failed.');
+    if (spinner) {
+      spinner.fail(message + ' Failed.');
+    } else {
+      console.error(`--- ${message} Failed. ---`); // Fallback for no ora
+    }
     throw error;
   }
 }
@@ -135,6 +156,22 @@ async function ensureChoco(cmd, pkg) {
 }
 
 /**
+ * Ensures a tool is installed or updated using Homebrew.
+ *
+ * @param {string} cmd - The command name (e.g., 'git').
+ * @param {string} pkg - The Homebrew package name (e.g., 'git').
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensureBrew(cmd, pkg) {
+  const message = `Ensuring ${cmd} (${pkg}) is installed and updated`;
+  if (!(await exists(cmd))) {
+    await runWithSpinner(`brew install ${pkg}`, `Installing ${cmd} (${pkg}) via Homebrew`);
+  } else {
+    await runWithSpinner(`brew upgrade ${pkg}`, `Upgrading ${cmd} (${pkg}) via Homebrew`);
+  }
+}
+
+/**
  * Ensures a package is installed or updated using the detected package manager.
  *
  * @param {object} mgr - The detected package manager object (e.g., {kind: "winget"}).
@@ -142,12 +179,17 @@ async function ensureChoco(cmd, pkg) {
  * @param {object} pkgInfo - Package information for different managers.
  * @param {string} pkgInfo.wingetId - Winget package ID.
  * @param {string} pkgInfo.chocoPkg - Chocolatey package name.
+ * @param {string} pkgInfo.brewPkg - Homebrew package name.
  * @returns {Promise<void>} A promise that resolves when the operation is complete.
  */
-async function ensurePkg(mgr, cmd, { wingetId, chocoPkg }) {
+async function ensurePkg(mgr, cmd, { wingetId, chocoPkg, brewPkg }) { // Added brewPkg
   if (mgr.kind === "winget") return await ensureWinget(cmd, wingetId);
   if (mgr.kind === "choco") return await ensureChoco(cmd, chocoPkg);
-  throw new Error("No supported package manager found (need winget/choco).");
+  if (mgr.kind === "brew") { // New: Handle brew
+    if (!brewPkg) throw new Error(`No brew package for ${cmd}`);
+    return await ensureBrew(cmd, brewPkg);
+  }
+  throw new Error("No supported package manager found (need winget/choco/brew/apt)."); // Updated error message
 }
 
 /**
@@ -176,12 +218,16 @@ async function ensureNpmGlobal(cmd, pkg) {
 async function ensureFlutter(mgr) {
   const message = `Ensuring Flutter is installed and updated`;
   if (!(await exists("flutter"))) {
-    if (mgr.kind === "winget") {
-      await runWithSpinner(`winget install --id Flutter.Flutter -e --source winget`, `Installing Flutter via winget`);
-    } else if (mgr.kind === "choco") {
-      await runWithSpinner(`choco install flutter -y`, `Installing Flutter via chocolatey`);
-    } else {
-      throw new Error("Flutter missing and no installer configured.");
+    // Try to install via package manager
+    try {
+      await ensurePkg(mgr, "flutter", {
+        wingetId: "Flutter.Flutter",
+        chocoPkg: "flutter",
+        brewPkg: "flutter" // Homebrew package for Flutter
+      });
+    } catch (e) {
+      console.log(`(Flutter install via package manager failed or not configured: ${e.message})`);
+      throw new Error("Flutter missing and no installer configured (or failed). Please install Flutter manually.");
     }
   } else {
     await runWithSpinner(`flutter upgrade`, `Upgrading Flutter SDK`);
@@ -197,11 +243,13 @@ async function ensureFlutter(mgr) {
 async function ensurePythonAndPipx(mgr) {
   // Python installation/update
   const pythonCmd = "python";
-  const pythonId = "Python.Python.3.12";
-  
   if (!(await exists(pythonCmd))) {
     try {
-      await runWithSpinner(`winget install --id ${pythonId} -e --source winget`, `Installing Python via winget`);
+      await ensurePkg(mgr, pythonCmd, {
+        wingetId: "Python.Python.3.12",
+        chocoPkg: "python",
+        brewPkg: "python"
+      });
     } catch {
       console.log("(Python install skipped: no mapping or installer issue)");
     }
@@ -213,15 +261,20 @@ async function ensurePythonAndPipx(mgr) {
 
   // Pipx installation/update
   const pipxCmd = "pipx";
-  const pipxId = "Python.Pipx";
-  
   if (!(await exists(pipxCmd))) {
     try {
-      await runWithSpinner(`winget install --id ${pipxId} -e --source winget`, `Installing pipx via winget`);
+      await ensurePkg(mgr, pipxCmd, {
+        wingetId: "Python.Pipx",
+        chocoPkg: "pipx",
+        brewPkg: "pipx" // pipx is generally installed via pip, but brew might have a package
+      });
     } catch {
       console.log("(pipx install skipped)");
     }
-    await runWithSpinner(`pipx install pipx`, `Installing pipx`); // Ensure pipx is installed through pip, or via a spinner
+    // After installing pipx, ensure it's set up
+    if (await exists(pipxCmd)) {
+      await runWithSpinner(`pipx ensurepath`, `Ensuring pipx path`);
+    }
   } else {
     try {
       await runWithSpinner(`pipx --version`, `Verifying pipx version`);
@@ -236,8 +289,11 @@ async function ensurePythonAndPipx(mgr) {
  */
 async function ensureAider() {
   const message = `Ensuring Aider is installed and updated`;
+  const platform = os.platform(); // Get platform
+  const searchCommand = platform === "win32" ? "findstr /i" : "grep -i"; // Use grep for non-Windows
+
   if (await exists("pipx")) {
-    const listed = await canRun(`pipx list | findstr /i aider-chat`); 
+    const listed = await canRun(`pipx list | ${searchCommand} aider-chat`); 
     if (listed) {
       await runWithSpinner(`pipx upgrade aider-chat`, `Upgrading Aider via pipx`);
     } else {
@@ -300,11 +356,11 @@ async function main() {
   console.log(`Bootstrap: OS=${os.platform()} pkgmgr=${mgr.kind}`);
 
   await Promise.all([
-    ensurePkg(mgr, "git", { wingetId: "Git.Git", chocoPkg: "git" }),
-    ensurePkg(mgr, "node", { wingetId: "OpenJS.NodeJS.LTS", chocoPkg: "nodejs-lts" }),
-    ensurePkg(mgr, "gh", { wingetId: "GitHub.cli", chocoPkg: "gh" }),
+    ensurePkg(mgr, "git", { wingetId: "Git.Git", chocoPkg: "git", brewPkg: "git" }),
+    ensurePkg(mgr, "node", { wingetId: "OpenJS.NodeJS.LTS", chocoPkg: "nodejs-lts", brewPkg: "node" }),
+    ensurePkg(mgr, "gh", { wingetId: "GitHub.cli", chocoPkg: "gh", brewPkg: "github-cli" }),
     ensureNpmGlobal("netlify", "netlify-cli"),
-    ensurePkg(mgr, "gcloud", { wingetId: "Google.CloudSDK", chocoPkg: "google-cloud-sdk" }),
+    ensurePkg(mgr, "gcloud", { wingetId: "Google.CloudSDK", chocoPkg: "google-cloud-sdk", brewPkg: "google-cloud-sdk" }),
     ensureFlutter(mgr),
   ]);
 
