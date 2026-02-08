@@ -1,0 +1,11 @@
+{
+  "defaults": {
+    "org": "my-company",
+    "private": true,
+    "netlify": true,
+    "gcp": {
+      "project": "my-project-id",
+      "region": "us-east1"
+    }
+  }
+}

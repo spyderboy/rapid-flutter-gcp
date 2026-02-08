@@ -1,117 +1,264 @@
 #!/usr/bin/env node
-import { execSync } from "child_process";
+import { exec } from "child_process";
 import os from "os";
-import { tools } from "./_tooling.config.mjs";
+import ora from 'ora';
 
+/**
+ * Executes a shell command asynchronously and streams its output to the console.
+ *
+ * @param {string} cmd - The command string to execute.
+ * @param {object} [options] - Options for the command execution.
+ * @param {boolean} [options.silent=false] - If true, suppresses console output (stdout/stderr) from the command itself.
+ * @returns {Promise<string>} A promise that resolves with the stdout of the command, or rejects on error.
+ */
 function run(cmd, { silent = false } = {}) {
-  if (!silent) console.log(`> ${cmd}`);
-  return execSync(cmd, { stdio: silent ? "pipe" : "inherit" });
+  return new Promise((resolve, reject) => {
+    if (!silent) console.log(`\n> ${cmd}`);
+    const child = exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`Error executing command: ${cmd}`);
+        if (stdout) console.error(stdout);
+        if (stderr) console.error(stderr);
+        reject(error);
+      } else {
+        if (!silent && stdout) console.log(stdout);
+        resolve(stdout);
+      }
+    });
+
+    if (!silent) {
+      child.stdout.pipe(process.stdout);
+      child.stderr.pipe(process.stderr);
+    }
+  });
 }
 
-function canRun(cmd) {
-  try { execSync(cmd, { stdio: "ignore" }); return true; }
-  catch { return false; }
+/**
+ * Checks if a command can be successfully executed without producing output.
+ *
+ * @param {string} cmd - The command to check.
+ * @returns {Promise<boolean>} A promise that resolves to true if the command can run, false otherwise.
+ */
+async function canRun(cmd) {
+  try {
+    await run(cmd, { silent: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function exists(cmd) {
+/**
+ * Checks if a given command/executable exists in the system's PATH.
+ *
+ * @param {string} cmd - The command to check for existence.
+ * @returns {Promise<boolean>} A promise that resolves to true if the command exists, false otherwise.
+ */
+async function exists(cmd) {
   const platform = os.platform();
-  if (platform === "win32") return canRun(`where ${cmd}`);
-  return canRun(`command -v ${cmd}`);
+  if (platform === "win32") return await canRun(`where ${cmd}`);
+  return await canRun(`command -v ${cmd}`);
 }
 
-function detectPkgMgr() {
+/**
+ * Detects the primary package manager available on the current operating system.
+ *
+ * @returns {Promise<{kind: "winget" | "choco" | "brew" | "apt" | "none"}>} A promise that resolves with an object indicating the package manager kind.
+ */
+async function detectPkgMgr() {
   const platform = os.platform();
   if (platform === "win32") {
-    if (exists("winget")) return { kind: "winget" };
-    if (exists("choco")) return { kind: "choco" };
+    if (await exists("winget")) return { kind: "winget" };
+    if (await exists("choco")) return { kind: "choco" };
     return { kind: "none" };
   }
-  if (platform === "darwin") return exists("brew") ? { kind: "brew" } : { kind: "none" };
-  // linux
-  if (exists("apt-get")) return { kind: "apt" };
+  if (platform === "darwin") return await exists("brew") ? { kind: "brew" } : { kind: "none" };
+  if (await exists("apt-get")) return { kind: "apt" };
   return { kind: "none" };
 }
 
-function installOrUpdateWithMgr(mgr, tool) {
-  if (mgr.kind === "winget") {
-    const id = tool?.win?.winget;
-    if (!id) throw new Error(`No winget id for ${tool.key}`);
-    if (!exists(tool.cmd)) {
-      run(`winget install --id ${id} -e --source winget`);
-    } else {
-      // winget upgrade sometimes returns non-zero when nothing to do; treat as non-fatal
-      try { run(`winget upgrade --id ${id} -e --source winget`); }
-      catch { console.log(`(winget: no update or non-fatal exit for ${id})`); }
-    }
-    return;
+/**
+ * Executes a shell command with a progress spinner for visual feedback.
+ *
+ * @param {string} cmd - The command string to execute.
+ * @param {string} message - The message to display next to the spinner.
+ * @param {object} [options] - Options for the command execution.
+ * @param {boolean} [options.silent=false] - If true, suppresses console output (stdout/stderr) from the command itself.
+ * @returns {Promise<string>} A promise that resolves with the stdout of the command, or rejects on error.
+ */
+async function runWithSpinner(cmd, message, { silent = false } = {}) {
+  const spinner = ora(message).start();
+  try {
+    const result = await run(cmd, { silent });
+    spinner.succeed(message + ' Done.');
+    return result;
+  } catch (error) {
+    spinner.fail(message + ' Failed.');
+    throw error;
   }
-
-  if (mgr.kind === "choco") {
-    const pkg = tool?.win?.choco;
-    if (!pkg) throw new Error(`No choco package for ${tool.key}`);
-    if (!exists(tool.cmd)) {
-      run(`choco install ${pkg} -y`);
-    } else {
-      run(`choco upgrade ${pkg} -y`);
-    }
-    return;
-  }
-
-  if (mgr.kind === "brew") {
-    // add brew mapping later if you want mac support
-    throw new Error("brew mappings not configured yet.");
-  }
-
-  if (mgr.kind === "apt") {
-    // add apt mapping later if you want linux support
-    throw new Error("apt mappings not configured yet.");
-  }
-
-  throw new Error("No supported package manager found (need winget/choco/brew/apt).");
 }
 
-function ensureNpmGlobal(pkg, cmd) {
-  if (!exists("npm")) throw new Error("npm not found. Ensure node is installed first.");
-  if (!exists(cmd)) run(`npm i -g ${pkg}`);
-  else run(`npm i -g ${pkg}@latest`);
-}
-
-function ensureFlutter(mgr) {
-  if (!exists("flutter")) {
-    // Install flutter. If you prefer winget, do it here.
-    // If you prefer zip-based Flutter, you can detect and prompt; but we’ll install via mgr for robustness.
-    if (mgr.kind === "winget") run(`winget install --id Flutter.Flutter -e --source winget`);
-    else if (mgr.kind === "choco") run(`choco install flutter -y`);
-    else throw new Error("Flutter missing and no installer configured for this OS.");
+/**
+ * Ensures a tool is installed or updated using Winget.
+ *
+ * @param {string} cmd - The command name (e.g., 'git').
+ * @param {string} id - The Winget package ID (e.g., 'Git.Git').
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensureWinget(cmd, id) {
+  const message = `Ensuring ${cmd} (${id}) is installed and updated`;
+  if (!(await exists(cmd))) {
+    await runWithSpinner(`winget install --id ${id} -e --source winget`, `Installing ${cmd} (${id})`);
   } else {
-    // Update Flutter regardless of installation method (zip/git/winget)
-    run(`flutter upgrade`);
+    try {
+      await runWithSpinner(`winget upgrade --id ${id} -e --source winget`, `Upgrading ${cmd} (${id})`);
+    } catch (e) {
+      console.log(`(winget: no update or non-fatal exit for ${id})`);
+    }
   }
 }
 
-function ensurePythonPackage(tool) {
-  // Prefer pipx if installed, otherwise fallback to python -m pip
-  if (exists("pipx")) {
-    // If aider is already installed via pipx, upgrade; otherwise install
-    // pipx list output is text; keep it simple:
-    const listed = canRun(`pipx list | findstr /i ${tool.pythonPackage}`);
-    if (listed) run(`pipx upgrade ${tool.pythonPackage}`);
-    else run(`pipx install ${tool.pythonPackage}`);
-    return;
+/**
+ * Ensures a tool is installed or updated using Chocolatey.
+ *
+ * @param {string} cmd - The command name (e.g., 'git').
+ * @param {string} pkg - The Chocolatey package name (e.g., 'git').
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensureChoco(cmd, pkg) {
+  const message = `Ensuring ${cmd} (${pkg}) is installed and updated`;
+  if (!(await exists(cmd))) {
+    await runWithSpinner(`choco install ${pkg} -y`, `Installing ${cmd} (${pkg})`);
+  } else {
+    await runWithSpinner(`choco upgrade ${pkg} -y`, `Upgrading ${cmd} (${pkg})`);
   }
-
-  if (!exists("python")) {
-    console.log("(python not found; skipping python-package installs)");
-    return;
-  }
-
-  // Ensure pip available + upgrade the package
-  run(`python -m pip install --upgrade pip`);
-  run(`python -m pip install --upgrade ${tool.pythonPackage}`);
 }
 
-function printVersions() {
-  const cmds = [
+/**
+ * Ensures a package is installed or updated using the detected package manager.
+ *
+ * @param {object} mgr - The detected package manager object (e.g., {kind: "winget"}).
+ * @param {string} cmd - The command name (e.g., 'git').
+ * @param {object} pkgInfo - Package information for different managers.
+ * @param {string} pkgInfo.wingetId - Winget package ID.
+ * @param {string} pkgInfo.chocoPkg - Chocolatey package name.
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensurePkg(mgr, cmd, { wingetId, chocoPkg }) {
+  if (mgr.kind === "winget") return await ensureWinget(cmd, wingetId);
+  if (mgr.kind === "choco") return await ensureChoco(cmd, chocoPkg);
+  throw new Error("No supported package manager found (need winget/choco).");
+}
+
+/**
+ * Ensures a global npm package is installed and updated.
+ *
+ * @param {string} cmd - The command name provided by the npm package (e.g., 'netlify').
+ * @param {string} pkg - The npm package name (e.g., 'netlify-cli').
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensureNpmGlobal(cmd, pkg) {
+  const message = `Ensuring ${pkg} is installed and updated globally`;
+  if (!(await exists("npm"))) throw new Error("npm not found. Ensure node is installed first.");
+  if (!(await exists(cmd))) {
+    await runWithSpinner(`npm i -g ${pkg}`, `Installing ${pkg} globally`);
+  } else {
+    await runWithSpinner(`npm i -g ${pkg} @latest`, `Upgrading ${pkg} globally`);
+  }
+}
+
+/**
+ * Ensures Flutter is installed and updated, preferring `flutter upgrade` if already present.
+ *
+ * @param {object} mgr - The detected package manager object.
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensureFlutter(mgr) {
+  const message = `Ensuring Flutter is installed and updated`;
+  if (!(await exists("flutter"))) {
+    if (mgr.kind === "winget") {
+      await runWithSpinner(`winget install --id Flutter.Flutter -e --source winget`, `Installing Flutter via winget`);
+    } else if (mgr.kind === "choco") {
+      await runWithSpinner(`choco install flutter -y`, `Installing Flutter via chocolatey`);
+    } else {
+      throw new Error("Flutter missing and no installer configured.");
+    }
+  } else {
+    await runWithSpinner(`flutter upgrade`, `Upgrading Flutter SDK`);
+  }
+}
+
+/**
+ * Ensures Python and pipx are installed and updated.
+ *
+ * @param {object} mgr - The detected package manager object.
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensurePythonAndPipx(mgr) {
+  // Python installation/update
+  const pythonCmd = "python";
+  const pythonId = "Python.Python.3.12";
+  
+  if (!(await exists(pythonCmd))) {
+    try {
+      await runWithSpinner(`winget install --id ${pythonId} -e --source winget`, `Installing Python via winget`);
+    } catch {
+      console.log("(Python install skipped: no mapping or installer issue)");
+    }
+  } else {
+    try {
+      await runWithSpinner(`python -m pip install --upgrade pip`, `Upgrading pip`);
+    } catch {}
+  }
+
+  // Pipx installation/update
+  const pipxCmd = "pipx";
+  const pipxId = "Python.Pipx";
+  
+  if (!(await exists(pipxCmd))) {
+    try {
+      await runWithSpinner(`winget install --id ${pipxId} -e --source winget`, `Installing pipx via winget`);
+    } catch {
+      console.log("(pipx install skipped)");
+    }
+    await runWithSpinner(`pipx install pipx`, `Installing pipx`); // Ensure pipx is installed through pip, or via a spinner
+  } else {
+    try {
+      await runWithSpinner(`pipx --version`, `Verifying pipx version`);
+    } catch {}
+  }
+}
+
+/**
+ * Ensures Aider is installed and updated using pipx or pip.
+ *
+ * @returns {Promise<void>} A promise that resolves when the operation is complete.
+ */
+async function ensureAider() {
+  const message = `Ensuring Aider is installed and updated`;
+  if (await exists("pipx")) {
+    const listed = await canRun(`pipx list | findstr /i aider-chat`); 
+    if (listed) {
+      await runWithSpinner(`pipx upgrade aider-chat`, `Upgrading Aider via pipx`);
+    } else {
+      await runWithSpinner(`pipx install aider-chat`, `Installing Aider via pipx`);
+    }
+    return;
+  }
+  if (await exists("python")) {
+    await runWithSpinner(`python -m pip install --upgrade aider-chat`, `Installing/Upgrading Aider via pip`);
+  } else {
+    console.log("(aider skipped: python not found)");
+  }
+}
+
+/**
+ * Prints the versions of various installed command-line tools.
+ *
+ * @returns {Promise<void>} A promise that resolves when all versions have been attempted to print.
+ */
+async function printVersions() {
+  const checks = [
     ["git", "--version"],
     ["node", "--version"],
     ["npm", "--version"],
@@ -120,13 +267,21 @@ function printVersions() {
     ["gcloud", "--version"],
     ["flutter", "--version"],
     ["aider", "--version"],
+    ["ollama", "--version"],
   ];
-  for (const [c, arg] of cmds) {
-    if (!exists(c)) continue;
-    try { run(`${c} ${arg}`); } catch { /* ignore */ }
+  for (const [c, arg] of checks) {
+    if (!(await exists(c))) continue;
+    try {
+      await run(`${c} ${arg}`);
+    } catch {}
   }
 }
 
+/**
+ * Provides hints for authenticating with various CLIs.
+ *
+ * @returns {void}
+ */
 function authHints() {
   console.log("\nAuth checks (run if needed):");
   console.log("  gh auth status");
@@ -134,43 +289,32 @@ function authHints() {
   console.log("  gcloud auth list");
 }
 
-function main() {
-  const mgr = detectPkgMgr();
-  console.log(`Bootstrap: OS=${os.platform()} pkgmgr=${mgr.kind}\n`);
+/**
+ * Main function to orchestrate the bootstrapping process.
+ * Detects OS and package manager, then ensures all required tools are installed and updated in parallel where possible.
+ *
+ * @returns {Promise<void>} A promise that resolves when the bootstrapping process is complete.
+ */
+async function main() {
+  const mgr = await detectPkgMgr();
+  console.log(`Bootstrap: OS=${os.platform()} pkgmgr=${mgr.kind}`);
 
-  // Ensure core tools first (order matters)
-  const ordered = [...tools].sort((a, b) => {
-    const order = ["git","node","gh","netlify","gcloud","flutter","python","pipx","aider"];
-    return order.indexOf(a.key) - order.indexOf(b.key);
-  });
+  await Promise.all([
+    ensurePkg(mgr, "git", { wingetId: "Git.Git", chocoPkg: "git" }),
+    ensurePkg(mgr, "node", { wingetId: "OpenJS.NodeJS.LTS", chocoPkg: "nodejs-lts" }),
+    ensurePkg(mgr, "gh", { wingetId: "GitHub.cli", chocoPkg: "gh" }),
+    ensureNpmGlobal("netlify", "netlify-cli"),
+    ensurePkg(mgr, "gcloud", { wingetId: "Google.CloudSDK", chocoPkg: "google-cloud-sdk" }),
+    ensureFlutter(mgr),
+  ]);
 
-  for (const t of ordered) {
-    // Special handlers
-    if (t.npmGlobal) {
-      ensureNpmGlobal(t.npmGlobal, t.cmd);
-      continue;
-    }
-    if (t.flutter) {
-      ensureFlutter(mgr);
-      continue;
-    }
-    if (t.pythonPackage) {
-      ensurePythonPackage(t);
-      continue;
-    }
-
-    // Regular CLI via package manager (skip optionals if no mapping)
-    if (!t.win?.winget && !t.win?.choco) {
-      if (!t.optional) console.log(`(no installer mapping for ${t.key}; skipping)`);
-      continue;
-    }
-    installOrUpdateWithMgr(mgr, t);
-  }
+  await ensurePythonAndPipx(mgr);
+  await ensureAider();
 
   console.log("\nVersions:");
-  printVersions();
-  authHints();
+  await printVersions();
 
+  authHints();
   console.log("\nDone.");
 }
 

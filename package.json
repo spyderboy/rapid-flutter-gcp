@@ -1,0 +1,12 @@
+{
+  "name": "rapid-dev-starter",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/__tests__/*.test.mjs"
+  },
+  "devDependencies": {
+    "ora": "^9.3.0"
+  }
+}
